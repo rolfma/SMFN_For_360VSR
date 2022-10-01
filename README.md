@@ -1,18 +1,51 @@
-# A Single Frame and Multi-Frame Joint Network for 360-degree Panorama Video Super-Resolution
+##  Code Repository for A Single Frame and Multi-Frame Joint Network for 360-degree Panorama Video Super-Resolution (SMFN)
 
-## Overview
-![Alt text](https://github.com/lovepiano/VSR_For_360/blob/master/Fig/network.png)
+### 1 Prerequisites
 
-## Requirements
-- Python 3.6
-- pytorch 1.1 , torchvision 0.3
+#### 1.1 Install PyTorch
 
-## Datasets
-The testing dataset can be obtained in https://drive.google.com/drive/folders/1CcBiblzkHVXZ1aSdSdZgvGPUkWuoMsE1?usp=sharing
-## Train
-
-## Test
-```
-python test.py
+```shell
+conda install pytorch torchvision torchaudio cudatoolkit=10.2 -c pytorch-lts
 ```
 
+#### 1.2 Install MMCV
+
+```shell
+pip install mmcv-full -f https://download.openmmlab.com/mmcv/dist/cu102/torch1.8.0/index.html
+```
+
+### 2 Data Preparation
+```shell
+ln -s /your/path data/MigVR
+ln -s /your/path data/MigVR56789
+ln -s /your/path data/MigVRTest
+```
+
+### 3 Train and Test
+#### 3.1 Init
+```shell
+python setup.py develop
+```
+
+#### 3.2 Train
+```shell
+python options/SMFN/train.py
+```
+
+#### 3.3 Test
+```
+python options/SMFN/test.py
+```
+
+
+### Acknowledgements
+The organization of this repository is modeled after BasicSR.
+```latex
+@misc{wang2020basicsr,
+  author =       {Xintao Wang and Ke Yu and Kelvin C.K. Chan and
+                  Chao Dong and Chen Change Loy},
+  title =        {{BasicSR}: Open Source Image and Video Restoration Toolbox},
+  howpublished = {\url{https://github.com/xinntao/BasicSR}},
+  year =         {2018}
+}
+```

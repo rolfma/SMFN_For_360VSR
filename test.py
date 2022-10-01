@@ -1,131 +1,102 @@
-import os
+from pathlib import Path
 import torch
-from torch.autograd import Variable
-from torch.utils.data import DataLoader
-import torch.backends.cudnn as cudnn
-from modules import VRCNN
-import argparse
-from data_utils import TrainsetLoader,ValidationsetLoader,TestsetLoader,ycbcr2rgb,mse_weight_loss
+import yaml
 import numpy as np
-import matplotlib.pyplot as plt
+import math
+import os
+from mynn.datasets import build_dataset, build_dataloader
+from mynn.matrics.ws_ssim import get_ws_ssim
+from mynn.models import build_model
+from mynn.matrics import get_ws_psnr
+from mynn.utils import get_root_logger
 from PIL import Image
-from model_log import *
-import time
-import torchvision
-from tqdm import tqdm
-from tensorboardX import SummaryWriter
-import torchvision.utils as utils
-from torchvision.transforms import ToPILImage,ToTensor
-from ws_psnr import ws_psnr
-from ws_ssim import ws_ssim
-from psnr import psnr, calculate_ssim
+from mynn.utils.img_util import rgb2ycbcr, ycbcr2rgb
 
-'''
-训练参数设置
-'''
-# Training settings
-parser = argparse.ArgumentParser(description='PyTorch Super Res Example')
-parser.add_argument('--upscale_factor', type=int, default=4, help="super resolution upscale factor")
-parser.add_argument('--test_val_batchSize', type=int, default=1, help='testing batch size')
-parser.add_argument('--seed', type=int, default=123, help='random seed to use. Default=123')  #暂时不用
-parser.add_argument('--gpus', default=4, type=int, help='number of gpu')
-parser.add_argument('--val_dataset_hr', type=str, default='/data1/zbr/VR-super-resolution/data/test/VR/GT')
-parser.add_argument('--val_dataset_lr', type=str, default='/data1/zbr/VR-super-resolution/data/test/VR/LR')
-parser.add_argument('--pre_result', type=str, default='./results',help='model prediction results')
-parser.add_argument('--model_save_folder', default='model/final_model/my_final-726dual', help='Location to save checkpoint models')
-parser.add_argument('--train_log', type=str,default='train_log')
-parser.add_argument('--exp_name', type=str,default='726xr-dual')
-parser.add_argument('--test_model', type=str, default='vrcnn_final_epoch_272.pth', help='lr change flag')
+from mynn.utils.logger import log_print
+from mynn.utils.misc import load_model
 
+# Read yaml file.
+YAML_PATH = 'options/LWPN/lwpn.yaml'
+with open(YAML_PATH, 'r', encoding='utf-8') as f:
+    opt = yaml.load(f, Loader=yaml.SafeLoader)
 
-opt = parser.parse_args()
-gpus_list = range(2,opt.gpus)
+# Set logger.
+log_dir = Path('experiments') / opt['exp_name']
+os.makedirs(log_dir, exist_ok=True)
+log_file = log_dir / f"{opt['test']['log_file']}"
+_logger = get_root_logger(log_file=log_file)
 
-def main():
-    
-	'''
-	训练时时并行的，测试时也应当并行，不然会报告如下的错误：
-	Missing key(s) in state_dict: ...(如：conv1.weight)
-	'''
-	print('testing processing....')
+# Choose CUDA or CPU.
+device = "cuda" if opt['test']['cuda'] else "cpu"
 
-	#加载模型
-	test_model = VRCNN(opt.upscale_factor)
-	test_model = torch.nn.DataParallel(test_model,device_ids=gpus_list,output_device=gpus_list[1])
+# Set GPU list.
+gpu_list = ",".join([str(v) for v in opt['test']['gpu_list']])
+os.environ['CUDA_VISIBLE_DEVICES'] = gpu_list
+log_print(f'device:{device}')
 
-	test_model = test_model.cuda(gpus_list[0])
+# Get dataset and dataloader.
+test_dataset = build_dataset(dataset_opt=opt['test']['dataset'], phase='test')
 
-	print('---------- Networks architecture -------------')
-	print_network(test_model)
-	print('----------------------------------------------')
+test_dataloader = build_dataloader(dataset=test_dataset, opt=opt, phase='test')
+# Build model.
+model = build_model(opt)
+model.to(device)
+model = torch.nn.DataParallel(model)
+# Load checkpoint.
+model = load_model(opt=opt, model=model)
 
-	#加载预训练模型
-	model_name = os.path.join(opt.model_save_folder,opt.exp_name,opt.test_model)
-	print('model_name=',model_name)
-	if os.path.exists(model_name):
-		pretrained_dict=torch.load(model_name,map_location=lambda storage, loc: storage)
-		model_dict=test_model.state_dict()
-		# 1. filter out unnecessary keys
-		pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
-		# 2. overwrite entries in the existing state dict
-		model_dict.update(pretrained_dict)
-		test_model.load_state_dict(model_dict)
-		print('Pre-trained SR model is loaded.')
+log_print('Testing start.')
 
-	if not os.path.exists(opt.pre_result):
-		os.mkdir(opt.pre_result)
+model.eval()
+total_step = len(test_dataloader)
+save_root = Path('./experiments') / \
+    opt['exp_name'] / 'results' / opt['test']['dataset']['name']
+log_print(f'Save path:{save_root}')
 
-	with open(opt.train_log + '/psnr_ssim-xr-200.txt', 'a') as psnr_ssim:
-		with torch.no_grad():
-			ave_psnr = 0
-			ave_ssim = 0
-			single_ave_psnr = 0
-			single_ave_ssim = 0
-			numb = 2
-			valSet = ValidationsetLoader(opt.val_dataset_hr,opt.val_dataset_lr)
-			valLoader = DataLoader(dataset=valSet,batch_size=opt.test_val_batchSize,shuffle=False)
-			val_bar = tqdm(valLoader)
-			for data in val_bar:
-				test_model.eval()
-				# dual_net.eval()
-				batch_lr_y, label, SR_cb,SR_cr,idx,bicubic_restore = data
-				batch_lr_y,label = Variable(batch_lr_y).cuda(gpus_list[0]), Variable(label).cuda(gpus_list[0])
-				output = test_model(batch_lr_y)
+val_ws_psnr = 0
+val_ws_ssim = 0
+with torch.no_grad():
+    for step, data in enumerate(test_dataloader):
+        # Unpack data.
+        gt = data['gt'][:, 0, :, :].unsqueeze(1)
+        lqs = data['lqs'][:, :, 0, :, :].unsqueeze(2).to(device)
+        img_bic = data['img_bic']
+        key = data['key'][0]
 
-				SR_ycbcr = np.concatenate((np.array(output.squeeze(0).data.cpu()), SR_cb, SR_cr), axis=0).transpose(1,2,0)            
-				SR_rgb = ycbcr2rgb(SR_ycbcr) * 255.0
-				SR_rgb = np.clip(SR_rgb, 0, 255)
-				SR_rgb = ToPILImage()(SR_rgb.astype(np.uint8))
-				#ToTensor() ---image(0-255)==>image(0-1), (H,W,C)==>(C,H,W)
-				SR_rgb = ToTensor()(SR_rgb)
+        # Forward propagation.
+        sr = model(lqs)
+        # Compute ws_psnr.
+        ws_psnr = get_ws_psnr(sr.cpu(), gt.cpu())
+        val_ws_psnr += ws_psnr
+        # Compute ws_ssim.
+        ws_ssim = get_ws_ssim(sr.cpu(), gt.cpu())
+        val_ws_ssim += ws_ssim
 
-				#将给定的Tensor保存成image文件。如果给定的是mini-batch tensor，那就用make-grid做成雪碧图，再保存。与utils.make_grid()配套使用
-				if not os.path.exists(opt.pre_result+'/'+opt.exp_name):
-					os.mkdir(opt.pre_result+'/'+opt.exp_name)
-				utils.save_image(SR_rgb, opt.pre_result+'/' +opt.exp_name +'/' + 'my'+str(numb).rjust(3,'0')+'.png') 
-				numb = numb + 1
+        y = sr.cpu().squeeze().numpy()
+        img_bic = img_bic.squeeze().numpy()
+        bic_ycbcr = rgb2ycbcr(img_bic)
+        cb = bic_ycbcr.squeeze()[:, :, 1]
+        cr = bic_ycbcr.squeeze()[:, :, 2]
 
-				psnr_value =  psnr(np.array(torch.squeeze(label).data.cpu())*255,np.array(torch.squeeze(output).data.cpu())*255)
-				ave_psnr = ave_psnr + psnr_value
-				single_ave_psnr = single_ave_psnr + psnr_value
-				ssim_value =  calculate_ssim(np.array(torch.squeeze(label).data.cpu())*255,np.array(torch.squeeze(output).data.cpu())*255)
-				ave_ssim = ave_ssim + ssim_value
-				single_ave_ssim = single_ave_ssim + ssim_value
-				
-				val_bar.set_description('===>{}th video {}th frame, wsPSNR:{:.4f} dB,wsSSIM:{:.6f}'.format(idx // 98 + 1,idx % 98 + 1,psnr_value,ssim_value))
-				
-				if idx == 293 or idx == 97 or idx == 195 or idx == 391:
-					print("===> {}th video Avg. wsPSNR: {:.4f} dB".format(idx // 98+1,single_ave_psnr / 98))
-					print("===> {}th video Avg. wsSSIM: {:.6f}".format(idx // 98+1,single_ave_ssim / 98))
-					psnr_ssim.write('===>{}th video avg wsPSNR:{:.4f} dB,wsSSIM:{:.6f}\n'.format(idx // 98+1,single_ave_psnr / 98,single_ave_ssim / 98))
-					single_ave_psnr = 0
-					single_ave_ssim = 0
+        ycbcr_img = np.stack([y, cb, cr], axis=2)
+        rgb_img = ycbcr2rgb(ycbcr_img)
 
-			print("===> All Avg. wsPSNR: {:.4f} dB".format(ave_psnr / len(valLoader)))
-			print("===> ALL Avg. wsSSIM: {:.6f}".format(ave_ssim / len(valLoader)))
-			psnr_ssim.write('===>all videos avg wsPSNR:{:.4f} dB,wsSSIM:{:.6f}\n'.format(ave_psnr / len(valLoader),ave_ssim / len(valLoader)))
+        # Save result.
+        clip_name, image_name = key.split('/')
+        save_dir = save_root / clip_name
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = save_dir / f'{image_name}.png'
 
-	print('testing finished!')
+        rgb_img = rgb_img * 255
+        rgb_img = np.clip(rgb_img, 0, 255).round()
+        sr_img = Image.fromarray(rgb_img.astype('uint8'))
+        sr_img.save(save_path)
+        print(f'{step+1}/{total_step}: {key}')
+        # if step > 1:
+        #     break
 
-if __name__ == '__main__':
-    main()
+    avg_val_ws_psnr = val_ws_psnr / (step + 1)
+    log_print(f'WS_PSNR:{avg_val_ws_psnr:.6f}')
+    avg_val_ws_ssim = val_ws_ssim / (step + 1)
+    log_print(f'WS_SSIM:{avg_val_ws_ssim:.6f}')
+    log_print('Test complete.')

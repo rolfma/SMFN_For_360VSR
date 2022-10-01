@@ -1,0 +1,59 @@
+model: VRCNN
+exp_name: SFMN_MigVR_Patch_08_08
+
+train:
+  gpu_list: [0,1]
+
+  lr: !!float 5e-5
+  betas: [0.9, 0.99]
+  batch_size: 16
+
+  one_through: false
+  total_iter: 600000
+  save_freq: 5000
+  val_freq: 5000
+  dis_freq: 100
+  log_file: train_2022_08_13.log
+
+  resume: true
+  resume_path: auto
+
+  dataset:
+    type: MigVRWithWeightDataset
+    name: MigVR
+    num_frame: 3
+    dataroot_gt: data/MigVR/HR
+    dataroot_lq: data/MigVR/LR
+    meta_info_file: mynn/datasets/meta_info_files/meta_info_MigVR.txt
+    val_partition: ""
+    interval_list: [1]
+    io_backend:
+      type: disk
+    gt_size: 192
+    scale: 4
+    num_workers: 4 # the number of workers per gpu
+    shuffle: true
+    use_hflip: true
+    use_rot: true
+
+test:
+  device: cpu # 'cpu' or 'cuda:0' 'cuda:1' ...
+  cuda: true
+  gpu_list: [1]
+
+  log_file: test_2022_09_05_545k.log
+
+  resume_path: experiments/SMFN_MigVR_Patch_08_08/checkpoints/model/model_545000.pth # 'auto' | path
+
+  dataset:
+    type: TestVideoDataset
+    name: MigVRTest
+    num_frame: 3
+    lq_root: data/MigVRTest/LR
+    gt_root: data/MigVRTest/HR
+    meta_info_file: mynn/datasets/meta_info_files/meta_info_MigVRTest.txt
+    min_frame_idx: 001
+    max_frame_idx: 100
+    mod_crop: 16
+    color_mode: "Y"
+    scale: 4
